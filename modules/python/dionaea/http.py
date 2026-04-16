@@ -783,6 +783,11 @@ class httpd(connection):
             )
         )
 
+        # LLM Cache integration: intercept specific requests
+        # Check if the request should be forwarded to LLM cache
+        if self._should_use_llm_cache(rpath):
+            return self._handle_llm_cache_request(rpath)
+
         if not apath.startswith(aroot):
             return self.send_error(404, "File not found")
 
@@ -951,6 +956,108 @@ class httpd(connection):
             else:
                 message = ''
         self.send("%s %d %s\r\n" % ("HTTP/1.1", code, message))
+
+    def _should_use_llm_cache(self, path: str) -> bool:
+        """
+        Determine if a request should be forwarded to the LLM cache service.
+        
+        This method checks if the request path matches patterns that should
+        be handled by the LLM cache. Examples:
+        - /protected/*
+        - /admin/*
+        - /api/*
+        
+        Args:
+            path: The normalized request path
+            
+        Returns:
+            True if the request should use LLM cache, False otherwise
+        """
+        # Import here to avoid issues if the module is not available
+        from dionaea.llm_cache import get_llm_cache_client
+        
+        llm_client = get_llm_cache_client()
+        if not llm_client.enabled:
+            return False
+        
+        # Define patterns that should trigger LLM cache
+        llm_patterns = [
+            '/protected/',
+            '/admin/',
+            '/api/',
+            '/secret/',
+            '/private/',
+            '/config/',
+            '/management/',
+        ]
+        
+        # Check if the path starts with any of the LLM patterns
+        for pattern in llm_patterns:
+            if path.startswith(pattern):
+                logger.info(f"Request matches LLM cache pattern: {path}")
+                return True
+        
+        return False
+
+    def _handle_llm_cache_request(self, path: str):
+        """
+        Handle a request by forwarding it to the LLM cache service.
+        
+        Args:
+            path: The normalized request path
+            
+        Returns:
+            A file-like object containing the response, or an error response
+        """
+        from dionaea.llm_cache import get_llm_cache_client
+        
+        llm_client = get_llm_cache_client()
+        
+        # Build the full request content (method + path + query params)
+        request_method = self.header.type.decode('utf-8') if isinstance(self.header.type, bytes) else self.header.type
+        request_content = f"{request_method} {path}"
+        
+        # Add query parameters if present
+        if self.header.fields:
+            query_parts = []
+            for key, values in self.header.fields.items():
+                for value in values:
+                    query_parts.append(f"{key}={value}")
+            if query_parts:
+                request_content += "?" + "&".join(query_parts)
+        
+        logger.info(f"Forwarding request to LLM cache: {request_content}")
+        
+        # Query the LLM cache
+        llm_response = llm_client.query_request(request_content)
+        
+        if llm_response is None:
+            # Fallback to 404 if LLM cache fails
+            logger.warning(f"LLM cache query failed for: {request_content}")
+            return self.send_error(404, "Resource not found")
+        
+        # Convert response to bytes if needed
+        if isinstance(llm_response, str):
+            llm_response = llm_response.encode('utf-8')
+        
+        # Send successful response with LLM content
+        self.send_response(200)
+        headers = self._get_headers(code=200)
+        headers.send(
+            self,
+            {
+                "connection": "close",
+                "content_length": len(llm_response),
+                "content_type": "text/html; charset=utf-8"
+            }
+        )
+        self.end_headers()
+        
+        # Return the LLM response as a file-like object
+        f = io.BytesIO()
+        f.write(llm_response)
+        f.seek(0)
+        return f
 
     def send_error(self, code, message=None):
         if message is None:
